@@ -115,3 +115,7 @@ Tests/SPM/Packages
 
 # Test products
 Tests/products
+
+GRDB.xcframework
+GRDB.xcframework.zip
+GRDB-*.xcarchive
