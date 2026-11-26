@@ -51,6 +51,26 @@ final class DAO<Record: MutablePersistableRecord> {
         returning selection: [any SQLSelectable])
     throws -> Statement
     {
+        // Without assignments or an update condition, the SQL only depends
+        // on the shape of the statement, and can be cached.
+        let cacheKey: UpsertQuery? = if assignments == nil && updateCondition == nil {
+            UpsertQuery(
+                tableName: databaseTableName,
+                insertedColumns: persistenceContainer.columns,
+                primaryKeyColumns: primaryKey.columns,
+                conflictTargetColumns: conflictTargetColumns,
+                strategy: strategy.rawValue,
+                hasReturningClause: !selection.isEmpty)
+        } else {
+            nil
+        }
+        if let cacheKey, let sql = UpsertQuery.cacheLock.read({ $0[cacheKey] }) {
+            return try makeStatement(
+                sql: sql,
+                checkedArguments: StatementArguments(persistenceContainer.values),
+                returning: selection)
+        }
+        
         // INSERT
         let insertedColumns = persistenceContainer.columns
         let columnsSQL = insertedColumns.map(\.quotedDatabaseIdentifier).joined(separator: ", ")
@@ -130,6 +150,10 @@ final class DAO<Record: MutablePersistableRecord> {
             let context = SQLGenerationContext(db)
             sql += try " WHERE " + condition.sqlExpression.sql(context)
             arguments += context.arguments
+        }
+        
+        if let cacheKey {
+            UpsertQuery.cacheLock.withLock { $0[cacheKey] = sql }
         }
         
         return try makeStatement(
@@ -312,6 +336,21 @@ extension InsertQuery {
             return sql
         }
     }
+}
+
+// MARK: - UpsertQuery
+
+/// The cache key of upsert statements built without assignments or
+/// update condition.
+private struct UpsertQuery: Hashable {
+    let tableName: String
+    let insertedColumns: [String]
+    let primaryKeyColumns: [String]
+    let conflictTargetColumns: [String]
+    let strategy: Int
+    let hasReturningClause: Bool
+    
+    static let cacheLock: ReadWriteLock<[UpsertQuery: String]> = ReadWriteLock([:])
 }
 
 // MARK: - UpdateQuery
