@@ -51,32 +51,31 @@ final class DAO<Record: MutablePersistableRecord> {
         returning selection: [any SQLSelectable])
     throws -> Statement
     {
-        // INSERT
-        let insertedColumns = persistenceContainer.columns
-        let columnsSQL = insertedColumns.map(\.quotedDatabaseIdentifier).joined(separator: ", ")
-        let valuesSQL = databaseQuestionMarks(count: insertedColumns.count)
-        var sql = """
-            INSERT INTO \(databaseTableName.quotedDatabaseIdentifier) (\(columnsSQL)) \
-            VALUES (\(valuesSQL))
-            """
-        var arguments = StatementArguments(persistenceContainer.values)
-        
-        // ON CONFLICT
-        if conflictTargetColumns.isEmpty {
-            sql += " ON CONFLICT"
-        } else {
-            let targetSQL = conflictTargetColumns
-                .map { $0.quotedDatabaseIdentifier }
-                .joined(separator: ", ")
-            sql += " ON CONFLICT(\(targetSQL))"
+        if assignments == nil && updateCondition == nil {
+            // The SQL does not depend on values: use the cached SQL.
+            let query = UpsertQuery(
+                tableName: databaseTableName,
+                insertedColumns: persistenceContainer.columns,
+                primaryKeyColumns: primaryKey.columns,
+                conflictTargetColumns: conflictTargetColumns,
+                updatesAllColumns: strategy.contains(.allColumns),
+                hasReturningClause: !selection.isEmpty)
+            return try makeStatement(
+                sql: query.sql,
+                checkedArguments: StatementArguments(persistenceContainer.values),
+                returning: selection)
         }
         
-        // DO UPDATE SET
+        // INSERT ... ON CONFLICT ... DO UPDATE SET
         // We update explicit assignments from the `assignments` parameter.
         // Other columns are overwritten by inserted values. This makes sure
         // that no information stored in the record is lost, unless explicitly
         // requested by the user.
-        sql += " DO UPDATE SET "
+        var sql = upsertPrefixSQL(
+            tableName: databaseTableName,
+            insertedColumns: persistenceContainer.columns,
+            conflictTargetColumns: conflictTargetColumns)
+        var arguments = StatementArguments(persistenceContainer.values)
         let excluded = TableAlias<Record>(name: "excluded")
         var assignments = assignments?(excluded) ?? []
         if strategy.contains(.allColumns) {
@@ -312,6 +311,87 @@ extension InsertQuery {
             return sql
         }
     }
+}
+
+// MARK: - UpsertQuery
+
+/// The SQL of an upsert statement without explicit assignments or
+/// update condition.
+private struct UpsertQuery: Hashable {
+    let tableName: String
+    let insertedColumns: [String]
+    let primaryKeyColumns: [String]
+    let conflictTargetColumns: [String]
+    let updatesAllColumns: Bool
+    let hasReturningClause: Bool
+}
+
+extension UpsertQuery {
+    private static let cacheLock: ReadWriteLock<[UpsertQuery: String]> = ReadWriteLock([:])
+    var sql: String {
+        if let sql = Self.cacheLock.read({ $0[self] }) {
+            return sql
+        }
+        
+        return Self.cacheLock.withLock { cache in
+            var sql = upsertPrefixSQL(
+                tableName: tableName,
+                insertedColumns: insertedColumns,
+                conflictTargetColumns: conflictTargetColumns)
+            
+            // Overwrite all columns but the primary key and conflict target
+            // with inserted values.
+            var updatedColumns: [String] = []
+            if updatesAllColumns {
+                let lowercaseExcludedColumns = Set(primaryKeyColumns.map { $0.lowercased() })
+                    .union(conflictTargetColumns.map { $0.lowercased() })
+                updatedColumns = insertedColumns.filter {
+                    !lowercaseExcludedColumns.contains($0.lowercased())
+                }
+            }
+            if updatedColumns.isEmpty {
+                if hasReturningClause {
+                    // Make sure the upsert returns a row, as in
+                    // `DAO.upsertStatement`.
+                    let column = primaryKeyColumns[0].quotedDatabaseIdentifier
+                    sql += "\(column) = \(column)"
+                }
+            } else {
+                let excluded = "excluded".quotedDatabaseIdentifier
+                sql += updatedColumns
+                    .map { "\($0.quotedDatabaseIdentifier) = \(excluded).\($0.quotedDatabaseIdentifier)" }
+                    .joined(separator: ", ")
+            }
+            
+            cache[self] = sql
+            return sql
+        }
+    }
+}
+
+/// Returns `INSERT INTO ... VALUES ... ON CONFLICT ... DO UPDATE SET `.
+private func upsertPrefixSQL(
+    tableName: String,
+    insertedColumns: [String],
+    conflictTargetColumns: [String])
+-> String
+{
+    let columnsSQL = insertedColumns.map(\.quotedDatabaseIdentifier).joined(separator: ", ")
+    let valuesSQL = databaseQuestionMarks(count: insertedColumns.count)
+    var sql = """
+        INSERT INTO \(tableName.quotedDatabaseIdentifier) (\(columnsSQL)) \
+        VALUES (\(valuesSQL))
+        """
+    if conflictTargetColumns.isEmpty {
+        sql += " ON CONFLICT"
+    } else {
+        let targetSQL = conflictTargetColumns
+            .map { $0.quotedDatabaseIdentifier }
+            .joined(separator: ", ")
+        sql += " ON CONFLICT(\(targetSQL))"
+    }
+    sql += " DO UPDATE SET "
+    return sql
 }
 
 // MARK: - UpdateQuery
